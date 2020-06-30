@@ -1,4 +1,4 @@
-package crud
+package gcrud
 
 import (
 	"github.com/gin-gonic/gin"
