@@ -1,17 +1,27 @@
 package gcrud
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
-	"net/http"
-	"reflect"
-	"strconv"
-	"strings"
-
 	"github.com/gin-gonic/gin"
 	"github.com/jinzhu/gorm"
+	"io"
+	"io/ioutil"
+	"net/http"
+	"reflect"
+	"strings"
 )
 
-// 查询参数
+// Handler
+type Handler interface {
+	Return(ctx *gin.Context, res interface{}, err error)
+}
+
+// handler
+type handler struct{}
+
+// Query query params.
 type Query struct {
 	Sort   string   `form:"sort" json:"sort,omitempty"`
 	Omit   []string `form:"omit" json:"omit,omitempty"`
@@ -21,7 +31,7 @@ type Query struct {
 	Size int `form:"size" json:"size,omitempty"`
 }
 
-// 查询结果
+// Result query restful.
 type Result struct {
 	Query
 	Count  int         `form:"count" json:"count"`
@@ -29,8 +39,27 @@ type Result struct {
 	Result interface{} `form:"result" json:"result"`
 }
 
+// omitParams omit query params.
 var omitParams = make(map[string]bool)
 
+// Default default handler.
+var Default handler
+
+// Return default return handle.
+func (h handler) Return(ctx *gin.Context, res interface{}, err error) {
+	if err != nil {
+		ctx.String(http.StatusInternalServerError, err.Error())
+		return
+	}
+	ctx.JSON(http.StatusOK, res)
+}
+
+// Mount mount to db and restful api.
+func (h handler) Mount(mux gin.IRouter, db *gorm.DB, model interface{}) gin.IRouter {
+	return Mount(mux, db, model, h)
+}
+
+// init init omit params.
 func init() {
 	t := reflect.TypeOf(Query{})
 	for i := 0; i < t.NumField(); i++ {
@@ -43,6 +72,30 @@ func init() {
 	}
 }
 
+// where request params to sql where element.
+func where(ctx *gin.Context, db *gorm.DB, model interface{}) *gorm.DB {
+	db = db.New()
+	var scope = db.NewScope(model)
+
+	_ = ctx.Request.ParseForm()
+	for key, val := range ctx.Request.Form {
+		if omitParams[key] {
+			continue
+		}
+
+		if _, ok := scope.FieldByName(key); ok && len(val) > 0 {
+			if len(val) > 1 {
+				db = db.Where(fmt.Sprintf("%s IN (?)", key), val)
+			} else {
+				db = db.Where(fmt.Sprintf("%s LIKE ?", key), fmt.Sprintf("%%%s%%", val[0]))
+			}
+		}
+	}
+
+	return db.Model(model)
+}
+
+// getType get type by model.
 func getType(model interface{}) reflect.Type {
 	modelType := reflect.TypeOf(model)
 	for modelType.Kind() == reflect.Ptr {
@@ -52,37 +105,35 @@ func getType(model interface{}) reflect.Type {
 	return modelType
 }
 
-// 从uri中获取参数id
-func getID(ctx *gin.Context) (id uint, err error) {
-	param := ctx.Param("id")
-	i, err := strconv.Atoi(param)
-	if err != nil {
-		return
+// getField get path field by index.
+func getField(ctx *gin.Context, index int) string {
+	path := strings.Trim(ctx.Request.URL.Path, "/")
+	fields := strings.Split(path, "/")
+	if index > 0 {
+		return fields[index]
 	}
-
-	return uint(i), nil
+	return fields[len(fields)+index]
 }
 
-// 获取单个 [GET] /$model/:id
+// [GET] /:field/:value
 func Get(ctx *gin.Context, db *gorm.DB, model interface{}) (record interface{}, err error) {
-	id, err := getID(ctx)
-	if err != nil {
-		return
-	}
+	var m = reflect.New(getType(model)).Elem()
 
-	var value = reflect.New(getType(model)).Elem()
+	db = where(ctx, db, model)
+	field := getField(ctx, -2)
+	value := ctx.Param("value")
 
-	if err = db.Model(model).Where("id = ?", id).First(value.Addr().Interface()).Error; err != nil {
+	if err = db.Where(field+" = ?", value).First(m.Addr().Interface()).Error; err != nil {
 		if gorm.IsRecordNotFoundError(err) {
 			err = nil
 		}
 		return
 	}
 
-	return value.Interface(), nil
+	return m.Interface(), nil
 }
 
-// 获取多个 [GET] /$model?page=1&size=10&params...
+// [GET] /?page=1&size=10&params...
 func Gets(ctx *gin.Context, db *gorm.DB, model interface{}) (result *Result, err error) {
 	var scope = db.NewScope(model)
 	var query Query
@@ -94,6 +145,8 @@ func Gets(ctx *gin.Context, db *gorm.DB, model interface{}) (result *Result, err
 	if err = db.Model(model).Count(&total).Error; err != nil {
 		return
 	}
+
+	db = where(ctx, db, model)
 
 	var slice = reflect.New(reflect.SliceOf(getType(model))).Elem()
 
@@ -139,15 +192,15 @@ func Gets(ctx *gin.Context, db *gorm.DB, model interface{}) (result *Result, err
 		}
 	}
 
-	for key, val := range ctx.Request.Form {
-		if omitParams[key] {
-			continue
-		}
-
-		if _, ok := scope.FieldByName(key); ok && len(val) > 0 {
-			db = db.Where(fmt.Sprintf("%s LIKE ?", key), fmt.Sprintf("%%%s%%", val[0]))
-		}
-	}
+	//for key, val := range ctx.Request.Form {
+	//	if omitParams[key] {
+	//		continue
+	//	}
+	//
+	//	if _, ok := scope.FieldByName(key); ok && len(val) > 0 {
+	//		db = db.Where(fmt.Sprintf("%s LIKE ?", key), fmt.Sprintf("%%%s%%", val[0]))
+	//	}
+	//}
 
 	if err = db.Find(slice.Addr().Interface()).Error; err != nil {
 		return
@@ -161,7 +214,7 @@ func Gets(ctx *gin.Context, db *gorm.DB, model interface{}) (result *Result, err
 	}, nil
 }
 
-// 新增单个 [POST] /name/ {}
+// [POST] / {}
 func Post(ctx *gin.Context, db *gorm.DB, model interface{}) (record interface{}, err error) {
 	var value = reflect.New(getType(model))
 	if err = ctx.Bind(value.Interface()); err != nil {
@@ -175,7 +228,7 @@ func Post(ctx *gin.Context, db *gorm.DB, model interface{}) (record interface{},
 	return value.Interface(), nil
 }
 
-// 新增多个 [POST] /name [{}]
+// [POST] / [{}]
 func Posts(ctx *gin.Context, db *gorm.DB, model interface{}) (records interface{}, err error) {
 	var slice = reflect.New(reflect.SliceOf(getType(model))).Elem()
 	if err = ctx.Bind(slice.Addr().Interface()); err != nil {
@@ -204,27 +257,24 @@ func Posts(ctx *gin.Context, db *gorm.DB, model interface{}) (records interface{
 	return slice.Interface(), nil
 }
 
-// 更新单个 [PUT] /name/:id {}
-func Put(ctx *gin.Context, db *gorm.DB, model interface{}) (err error) {
-	id, err := getID(ctx)
-	if err != nil {
+// [PUT] /:field/:value {}
+func Put(ctx *gin.Context, db *gorm.DB, model interface{}) (affected int64, err error) {
+	var m map[string]interface{}
+	if err = ctx.Bind(&m); err != nil {
 		return
 	}
 
-	var value map[string]interface{}
-	if err = ctx.Bind(&value); err != nil {
-		return
-	}
+	db = where(ctx, db, model)
+	field := getField(ctx, -2)
+	value := ctx.Param("value")
 
-	if err = db.Model(model).Where("id = ?", id).Updates(value).Error; err != nil {
-		return
-	}
+	db = db.Where(field+" = ?", value).Updates(m)
 
-	return
+	return db.RowsAffected, db.Error
 }
 
-// 更新多个 [PUT] /name [{"id":1}]
-func Puts(ctx *gin.Context, db *gorm.DB, model interface{}) (err error) {
+// [PUT] /$field [{"id":1}]
+func Puts(ctx *gin.Context, db *gorm.DB, model interface{}) (affected int64, err error) {
 	var values []map[string]interface{}
 	if err = ctx.Bind(&values); err != nil {
 		return
@@ -239,12 +289,19 @@ func Puts(ctx *gin.Context, db *gorm.DB, model interface{}) (err error) {
 		if err != nil {
 			tx.Rollback()
 		} else {
-			err = tx.Commit().Error
+			tx = tx.Commit()
+			affected = tx.RowsAffected
+			err = tx.Error
 		}
 	}()
 
+	tx = where(ctx, tx, model)
+	field := getField(ctx, -1)
+
 	for _, value := range values {
-		if err = db.Model(model).Where("id = ?", value["id"]).Updates(value).Error; err != nil {
+		v := value[field]
+		delete(value, field)
+		if err = tx.Where(field+" = ?", v).Updates(value).Error; err != nil {
 			return
 		}
 	}
@@ -252,123 +309,135 @@ func Puts(ctx *gin.Context, db *gorm.DB, model interface{}) (err error) {
 	return
 }
 
-// 删除单个 [DELETE] /name/:id
-func Delete(ctx *gin.Context, db *gorm.DB, model interface{}) (err error) {
-	id, err := getID(ctx)
-	if err != nil {
-		return
-	}
+// [DELETE] /:field/:value
+func Delete(ctx *gin.Context, db *gorm.DB, model interface{}) (affected int64, err error) {
+	db = where(ctx, db, model)
+	field := getField(ctx, -2)
+	value := ctx.Param("value")
 
-	if db = db.Model(model).Where("id = ?", id).Delete(model); db.Error != nil {
-		return db.Error
-	}
+	db = db.Where(field+" = ?", value).Delete(model)
 
-	//if db.RowsAffected != 1 {
-	//	return fmt.Errorf("delete rows not 1, affected: %d", db.RowsAffected)
-	//}
-
-	return
+	return db.RowsAffected, db.Error
 }
 
-// 删除多个 [DELETE] /name [id]
-func Deletes(ctx *gin.Context, db *gorm.DB, model interface{}) (err error) {
-	var id []uint
-	if err = ctx.Bind(&id); err != nil {
+// [DELETE] /:field []
+func Deletes(ctx *gin.Context, db *gorm.DB, model interface{}) (affected int64, err error) {
+	var values []interface{}
+	if err = ctx.Bind(&values); err != nil {
 		return
 	}
 
-	if len(id) == 0 {
+	if len(values) == 0 {
 		return
 	}
 
-	if db = db.Model(model).Where("id IN (?)", id).Delete(model); db.Error != nil {
-		return db.Error
-	}
+	db = where(ctx, db, model)
+	field := getField(ctx, -1)
 
-	//if db.RowsAffected != int64(len(id)) {
-	//	return fmt.Errorf("delete row:%d != affected:%d", len(id), db.RowsAffected)
-	//}
+	db = db.Where(field+" IN (?)", values).Delete(model)
 
-	return
+	return db.RowsAffected, db.Error
 }
 
-func doReturn(ctx *gin.Context, res interface{}, err error) {
-	if err != nil {
-		ctx.String(http.StatusInternalServerError, err.Error())
-		return
+// Mount mount model to db and restful api.
+func Mount(mux gin.IRouter, db *gorm.DB, model interface{}, handler ...Handler) gin.IRouter {
+	var h Handler = Default
+	if len(handler) > 0 {
+		h = handler[0]
 	}
-	ctx.JSON(http.StatusOK, res)
-}
 
-func Mount(mux gin.IRouter, db *gorm.DB, name string, model interface{}) gin.IRouter {
-	name = "/" + strings.TrimLeft(name, "/")
-
-	// 获取单个
 	get := func(ctx *gin.Context) {
 		record, err := Get(ctx, db, model)
-		doReturn(ctx, record, err)
+		h.Return(ctx, record, err)
 	}
 
-	// 获取多个
 	gets := func(ctx *gin.Context) {
 		result, err := Gets(ctx, db, model)
-		doReturn(ctx, result, err)
+		h.Return(ctx, result, err)
 	}
 
-	// 创建单个
 	post := func(ctx *gin.Context) {
 		record, err := Post(ctx, db, model)
-		doReturn(ctx, record, err)
+		h.Return(ctx, record, err)
 	}
 
-	// 创建多个
 	posts := func(ctx *gin.Context) {
 		records, err := Posts(ctx, db, model)
-		doReturn(ctx, records, err)
+		h.Return(ctx, records, err)
 	}
 
-	// 更新单个
 	put := func(ctx *gin.Context) {
-		err := Put(ctx, db, model)
-		doReturn(ctx, nil, err)
+		affected, err := Put(ctx, db, model)
+		h.Return(ctx, affected, err)
 	}
 
-	// 更新多个
 	puts := func(ctx *gin.Context) {
-		err := Puts(ctx, db, model)
-		doReturn(ctx, nil, err)
+		affected, err := Puts(ctx, db, model)
+		h.Return(ctx, affected, err)
 	}
 
-	// 删除单个
 	del := func(ctx *gin.Context) {
-		err := Delete(ctx, db, model)
-		doReturn(ctx, nil, err)
+		affected, err := Delete(ctx, db, model)
+		h.Return(ctx, affected, err)
 	}
 
-	// 删除多个
 	deletes := func(ctx *gin.Context) {
-		err := Deletes(ctx, db, model)
-		doReturn(ctx, nil, err)
+		affected, err := Deletes(ctx, db, model)
+		h.Return(ctx, affected, err)
 	}
 
-	batch := mux.Group("/batch")
-	{
-		group := batch.Group(name)
-		{
-			group.GET("", gets)
-			group.POST("", posts)
-			group.PUT("", puts)
-			group.DELETE("", deletes)
+	// generate restful api
+	var scope = db.NewScope(model)
+	for _, f := range scope.Fields() {
+		for _, name := range []string{f.Name, f.DBName} {
+			field := mux.Group(name)
+			{
+				field.PUT("", puts)
+				field.DELETE("", deletes)
+			}
+
+			value := field.Group("/:value")
+			{
+				value.GET("", get)
+				value.PUT("", put)
+				value.DELETE("", del)
+			}
+
+			if f.Name == f.DBName {
+				break
+			}
 		}
 	}
 
-	group := mux.Group(name)
-	{
-		group.GET("/:id", get)
-		group.POST("", post)
-		group.PUT("/:id", put)
-		group.DELETE("/:id", del)
-	}
+	// generate batch restful api
+	mux.GET("", gets)
+	mux.POST("", func(ctx *gin.Context) {
+		data, err := ioutil.ReadAll(ctx.Request.Body)
+		if err != nil {
+			h.Return(ctx, nil, err)
+			return
+		}
+		defer ctx.Request.Body.Close()
 
-	return group
+		reader := ioutil.NopCloser(bytes.NewReader(data))
+		ctx.Request.Body = reader
+		ctx.Request.GetBody = func() (closer io.ReadCloser, err error) {
+			return reader, nil
+		}
+
+		var v interface{}
+		if err = json.Unmarshal(data, &v); err != nil {
+			h.Return(ctx, nil, err)
+			return
+		}
+
+		if _, ok := v.([]interface{}); ok {
+			posts(ctx)
+			return
+		}
+
+		post(ctx)
+	})
+
+	return mux
 }
