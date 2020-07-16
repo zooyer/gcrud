@@ -193,16 +193,6 @@ func Gets(ctx *gin.Context, db *gorm.DB, model interface{}) (result *Result, err
 		}
 	}
 
-	//for key, val := range ctx.Request.Form {
-	//	if omitParams[key] {
-	//		continue
-	//	}
-	//
-	//	if _, ok := scope.FieldByName(key); ok && len(val) > 0 {
-	//		db = db.Where(fmt.Sprintf("%s LIKE ?", key), fmt.Sprintf("%%%s%%", val[0]))
-	//	}
-	//}
-
 	if err = db.Find(slice.Addr().Interface()).Error; err != nil {
 		return
 	}
