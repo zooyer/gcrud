@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
+	"test/zzy"
 	"testing"
 	"time"
 
@@ -34,12 +36,14 @@ var (
 )
 
 func init() {
+	gin.SetMode("release")
+
 	var err error
 	if db, err = gorm.Open("sqlite3", ":memory:"); err != nil {
 		panic(err)
 	}
 
-	//db = db.Debug()
+	db = db.Debug()
 
 	db.AutoMigrate(&people{})
 	var peoples = []people{
@@ -70,17 +74,20 @@ func init() {
 
 func newReq(method, uri string, data interface{}, params ...string) (*http.Request, error) {
 	var body io.Reader
+
+	u, err := url.Parse("http://127.0.0.1:8080" + uri)
+	if err != nil {
+		return nil, err
+	}
+
 	if data != nil {
 		data, err := json.Marshal(data)
 		if err != nil {
 			return nil, err
 		}
 		body = bytes.NewReader(data)
-	}
-
-	u, err := url.Parse("http://127.0.0.1:8080" + uri)
-	if err != nil {
-		return nil, err
+		zzy.ZDebug("Request URL:", u.String())
+		zzy.ZDebug("Body:", string(data))
 	}
 
 	query := u.Query()
@@ -157,12 +164,40 @@ func stop(t *testing.T) {
 	close(done)
 }
 
+func (p *people) Create(req struct {
+	Name string `json:"name"`
+	Age  int    `json:"age"`
+}) {
+	p.Name = strings.ToUpper(req.Name)
+	p.Age = req.Age * 10
+}
+
+func (p *people) Update2(ctx *gin.Context, req *struct {
+	ID   uint   `json:"id"`
+	Name string `json:"name"`
+	Age  int    `json:"age"`
+}) error {
+	p.ID = req.ID
+	p.Name = strings.ToUpper(req.Name)
+	p.Age = req.Age * 10
+	return nil
+}
+
+func (p *people) Update(ctx *gin.Context, req map[string]interface{}) (map[string]interface{}, error) {
+	return req, nil
+	p.ID = uint(req["id"].(float64))
+	p.Name = strings.ToUpper(req["name"].(string))
+	p.Age = int(req["age"].(float64) * 10)
+	return nil, nil
+}
+
 func TestMount(t *testing.T) {
-	assert := func(res string, err error) {
+	assert := func(res interface{}, err error) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		t.Log(res)
+		//t.Log(res)
+		zzy.ZDebug("Response:", res)
 	}
 	p := engine.Group("/people")
 	Mount(p, db, &people{})
@@ -173,10 +208,25 @@ func TestMount(t *testing.T) {
 		assert(del("/people/id/1", nil))
 		assert(del("/people/id", []int{1, 2}))
 		assert(put("/people/id/3", map[string]interface{}{"name": "c", "age": 3}))
-		assert(put("/people/id", []map[string]interface{}{{"name": "d", "age": 4}, {"name": "e", "age": 5}}))
+		assert(put("/people/id", []map[string]interface{}{{"id": 4, "name": "d", "age": 4}, {"id": 5, "name": "e", "age": 5}}))
 		assert(get("/people/id/5"))
 		assert(get("/people"))
-		stop(t)
+		//stop(t)
 	}()
 	<-done
+}
+
+type E struct {
+}
+
+func (E) Error() string {
+	return ""
+}
+
+func Print(t *testing.T, v interface{}) {
+	e, ok := v.(error)
+	t.Log(e, ok)
+}
+
+func TestTTT(t *testing.T) {
 }

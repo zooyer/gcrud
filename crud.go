@@ -2,16 +2,16 @@ package gcrud
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/gin-gonic/gin"
+	"github.com/jinzhu/gorm"
 	"io"
 	"io/ioutil"
 	"net/http"
 	"reflect"
 	"strings"
-
-	"github.com/gin-gonic/gin"
-	"github.com/jinzhu/gorm"
 )
 
 // Handler
@@ -40,11 +40,27 @@ type Result struct {
 	Result interface{} `form:"result" json:"result"`
 }
 
+const (
+	// context key in db scope.
+	keyContext = "context"
+
+	// value key in url params.
+	keyParamValue = "value"
+)
+
 // omitParams omit query params.
 var omitParams = make(map[string]bool)
 
 // Default default handler.
 var Default handler
+
+var (
+	// ctxType ctx type from gin context.
+	ctxType = reflect.TypeOf(&gin.Context{})
+
+	// errType err type from error.
+	errType = reflect.TypeOf((*error)(nil)).Elem()
+)
 
 // Return default return handle.
 func (h handler) Return(ctx *gin.Context, res interface{}, err error) {
@@ -73,9 +89,9 @@ func init() {
 	}
 }
 
-// where request params to sql where element.
-func where(ctx *gin.Context, db *gorm.DB, model interface{}) *gorm.DB {
-	db = db.New()
+// Where request params to sql where element.
+func Where(ctx *gin.Context, db *gorm.DB, model interface{}, field ...int) *gorm.DB {
+	db = db.New().Set(keyContext, ctx)
 	var scope = db.NewScope(model)
 
 	_ = ctx.Request.ParseForm()
@@ -93,11 +109,32 @@ func where(ctx *gin.Context, db *gorm.DB, model interface{}) *gorm.DB {
 		}
 	}
 
-	return db.Model(model)
+	if len(field) > 0 && field[0] < 0 {
+		field := GetField(ctx, field[0])
+		value := GetValue(ctx)
+		db = db.Where(field+" = ?", value)
+	}
+
+	return db.Model(reflect.New(GetType(model)).Interface())
+}
+
+// useDB set ctx in db.
+func useDB(ctx context.Context, db *gorm.DB) *gorm.DB {
+	return db.Set(keyContext, ctx)
+}
+
+// GetContext get context from db.
+func GetContext(scope *gorm.Scope) context.Context {
+	if v, exists := scope.Get(keyContext); exists {
+		if ctx, ok := v.(context.Context); ok {
+			return ctx
+		}
+	}
+	return context.Background()
 }
 
 // getType get type by model.
-func getType(model interface{}) reflect.Type {
+func GetType(model interface{}) reflect.Type {
 	modelType := reflect.TypeOf(model)
 	for modelType.Kind() == reflect.Ptr {
 		modelType = modelType.Elem()
@@ -106,8 +143,8 @@ func getType(model interface{}) reflect.Type {
 	return modelType
 }
 
-// getField get path field by index.
-func getField(ctx *gin.Context, index int) string {
+// GetField get path field by index.
+func GetField(ctx *gin.Context, index int) string {
 	path := strings.Trim(ctx.Request.URL.Path, "/")
 	fields := strings.Split(path, "/")
 	if index > 0 {
@@ -116,15 +153,136 @@ func getField(ctx *gin.Context, index int) string {
 	return fields[len(fields)+index]
 }
 
-// [GET] /:field/:value
+// GetValue get value by uri param.
+func GetValue(ctx *gin.Context) string {
+	return ctx.Param(keyParamValue)
+}
+
+// BindHook get model hook.
+func BindHook(model interface{}, name string) (this, hook reflect.Value, exists bool) {
+	this = reflect.New(GetType(model))
+	if hook = this.MethodByName(name); hook.IsValid() && !hook.IsNil() {
+		exists = true
+	}
+	return
+}
+
+// CallHook bind hook request params and call hook function from model.
+func CallHook(ctx *gin.Context, this, hook reflect.Value, model interface{}, batch ...bool) (bind reflect.Value, err error) {
+	// 检查入参个数
+	var in1, in2 []reflect.Value
+	if t := hook.Type(); t.NumIn() > 0 {
+		// 传入gin.Context参数
+		if t.In(0) == ctxType {
+			in1 = append(in1, reflect.ValueOf(ctx))
+		}
+
+		// 传入dto请求参数
+		if inType := t.In(t.NumIn() - 1); inType != ctxType {
+			var inValue reflect.Value
+
+			// 请求参数
+			if len(batch) > 0 && batch[0] {
+				inValue = reflect.New(reflect.SliceOf(inType)).Elem()
+			} else {
+				inValue = reflect.New(inType).Elem()
+			}
+
+			// 绑定请求参数
+			if err = ctx.Bind(inValue.Addr().Interface()); err != nil {
+				return
+			}
+
+			// 分解成hook函数参数
+			if inValue.Kind() == reflect.Slice {
+				for i := 0; i < inValue.Len(); i++ {
+					in2 = append(in2, inValue.Index(i))
+				}
+			} else {
+				in2 = append(in2, inValue)
+			}
+		}
+	}
+
+	// 创建bind结构
+	if len(batch) > 0 && batch[0] {
+		bind = reflect.New(reflect.SliceOf(GetType(model))).Elem()
+	} else {
+		bind = reflect.New(GetType(model)).Elem()
+	}
+
+	// 调用hook函数
+	for i := 0; i < len(in2); i++ {
+		if res := hook.Call(append(in1, in2[i])); len(res) > 0 {
+			var ok bool
+			if res[len(res)-1].Type().Implements(errType) {
+				if err, ok = res[len(res)-1].Interface().(error); ok && err != nil {
+					return
+				}
+			}
+
+			if !res[0].Type().Implements(errType) {
+				if len(batch) > 0 && batch[0] {
+					if t := res[0].Type(); t != bind.Type().Elem() {
+						bind = reflect.New(reflect.SliceOf(res[0].Type())).Elem()
+					}
+					bind = reflect.Append(bind, res[0])
+				} else {
+					if t := res[0].Type(); t != bind.Type() {
+						bind = reflect.New(t).Elem()
+					}
+					bind.Set(res[0])
+				}
+				continue
+			}
+		}
+
+		// hook函数没有返回值, 取this值
+		if len(batch) > 0 && batch[0] {
+			if bind.Type().Elem() != this.Type().Elem() {
+				bind = reflect.New(reflect.SliceOf(this.Type().Elem())).Elem()
+			}
+			bind = reflect.Append(bind, this.Elem())
+		} else {
+			if bind.Type() != this.Type().Elem() {
+				bind = this.Elem()
+			} else {
+				bind.Set(this.Elem())
+			}
+		}
+	}
+
+	return
+}
+
+// CallBindHook bind request params call hook function from model.
+func CallBindHook(ctx *gin.Context, this, hook reflect.Value, model interface{}, batch ...bool) (bind reflect.Value, err error) {
+	if this.IsValid() && !this.IsNil() && hook.IsValid() && !hook.IsNil() {
+		return CallHook(ctx, this, hook, model, batch...)
+	}
+
+	if len(batch) > 0 && batch[0] {
+		bind = reflect.New(reflect.SliceOf(GetType(model))).Elem()
+	} else {
+		bind = reflect.New(GetType(model)).Elem()
+	}
+
+	if err = ctx.Bind(bind.Addr().Interface()); err != nil {
+		return
+	}
+
+	return
+}
+
+// Get get value from model.
+// @Method: GET
+// @Params: model element
+// @URI: /$model/$field/:value
+// @Return: $model
 func Get(ctx *gin.Context, db *gorm.DB, model interface{}) (record interface{}, err error) {
-	var m = reflect.New(getType(model)).Elem()
+	var m = reflect.New(GetType(model)).Elem()
 
-	db = where(ctx, db, model)
-	field := getField(ctx, -2)
-	value := ctx.Param("value")
-
-	if err = db.Where(field+" = ?", value).First(m.Addr().Interface()).Error; err != nil {
+	if err = Where(ctx, db, model, -2).First(m.Addr().Interface()).Error; err != nil {
 		if gorm.IsRecordNotFoundError(err) {
 			err = nil
 		}
@@ -134,8 +292,12 @@ func Get(ctx *gin.Context, db *gorm.DB, model interface{}) (record interface{}, 
 	return m.Interface(), nil
 }
 
-// [GET] /?page=1&size=10&params...
-func Gets(ctx *gin.Context, db *gorm.DB, model interface{}) (result *Result, err error) {
+// List get model list by params.
+// @Method: GET
+// @Params: page/size/order/omit/select and model element
+// @URI: /$model
+// @Return: Result
+func List(ctx *gin.Context, db *gorm.DB, model interface{}) (result *Result, err error) {
 	var scope = db.NewScope(model)
 	var query Query
 	if err = ctx.Bind(&query); err != nil {
@@ -147,9 +309,9 @@ func Gets(ctx *gin.Context, db *gorm.DB, model interface{}) (result *Result, err
 		return
 	}
 
-	db = where(ctx, db, model)
+	db = Where(ctx, db, model)
 
-	var slice = reflect.New(reflect.SliceOf(getType(model))).Elem()
+	var slice = reflect.New(reflect.SliceOf(GetType(model))).Elem()
 
 	// select field
 	var selected = make(map[string]bool)
@@ -205,24 +367,32 @@ func Gets(ctx *gin.Context, db *gorm.DB, model interface{}) (result *Result, err
 	}, nil
 }
 
-// [POST] / {}
-func Post(ctx *gin.Context, db *gorm.DB, model interface{}) (record interface{}, err error) {
-	var value = reflect.New(getType(model))
-	if err = ctx.Bind(value.Interface()); err != nil {
-		return nil, err
+// Create create a model.
+// @Method: POST
+// @URI: /$model
+// @Return: $model
+func Create(ctx *gin.Context, db *gorm.DB, model interface{}) (record interface{}, err error) {
+	this, hook, _ := BindHook(model, "Create")
+	value, err := CallBindHook(ctx, this, hook, model)
+	if err != nil {
+		return
 	}
 
-	if err = db.Create(value.Interface()).Error; err != nil {
+	if err = db.Create(value.Addr().Interface()).Error; err != nil {
 		return
 	}
 
 	return value.Interface(), nil
 }
 
-// [POST] / [{}]
-func Posts(ctx *gin.Context, db *gorm.DB, model interface{}) (records interface{}, err error) {
-	var slice = reflect.New(reflect.SliceOf(getType(model))).Elem()
-	if err = ctx.Bind(slice.Addr().Interface()); err != nil {
+// Create create multi models.
+// @Method: POST
+// @URI: /$model
+// @Return: $model[]
+func Creates(ctx *gin.Context, db *gorm.DB, model interface{}) (records interface{}, err error) {
+	this, hook, _ := BindHook(model, "Create")
+	slice, err := CallBindHook(ctx, this, hook, model, true)
+	if err != nil {
 		return
 	}
 
@@ -248,30 +418,45 @@ func Posts(ctx *gin.Context, db *gorm.DB, model interface{}) (records interface{
 	return slice.Interface(), nil
 }
 
-// [PUT] /:field/:value {}
-func Put(ctx *gin.Context, db *gorm.DB, model interface{}) (affected int64, err error) {
-	var m map[string]interface{}
-	if err = ctx.Bind(&m); err != nil {
+// Update update a model by params.
+// @Method: PUT
+// @Params: model element
+// @URI: /$model/$field/:value
+// @Return: affected number
+func Update(ctx *gin.Context, db *gorm.DB, model interface{}) (affected int64, err error) {
+	this, hook, _ := BindHook(model, "Update")
+	value, err := CallBindHook(ctx, this, hook, map[string]interface{}{})
+	if err != nil {
 		return
 	}
 
-	db = where(ctx, db, model)
-	field := getField(ctx, -2)
-	value := ctx.Param("value")
+	switch v := value.Interface().(type) {
+	case map[string]interface{}:
+		delete(v, GetField(ctx, -2))
+	default:
+		if field := value.FieldByName("ID"); field.IsValid() && !field.IsZero() {
+			field.Set(reflect.Zero(field.Type()))
+		}
+	}
 
-	db = db.Where(field+" = ?", value).Updates(m)
+	db = Where(ctx, db, model, -2).Update(value.Interface())
 
 	return db.RowsAffected, db.Error
 }
 
-// [PUT] /$field [{"id":1}]
-func Puts(ctx *gin.Context, db *gorm.DB, model interface{}) (affected int64, err error) {
-	var values []map[string]interface{}
-	if err = ctx.Bind(&values); err != nil {
+// Updates update multi model by field and params.
+// @Method: PUT
+// @Params: model element
+// @URI: /$model/$field
+// @Return: affected number
+func Updates(ctx *gin.Context, db *gorm.DB, model interface{}) (affected int64, err error) {
+	this, hook, _ := BindHook(model, "Update")
+	values, err := CallBindHook(ctx, this, hook, map[string]interface{}{}, true)
+	if err != nil {
 		return
 	}
 
-	if len(values) == 0 {
+	if values.Len() == 0 {
 		return
 	}
 
@@ -280,38 +465,49 @@ func Puts(ctx *gin.Context, db *gorm.DB, model interface{}) (affected int64, err
 		if err != nil {
 			tx.Rollback()
 		} else {
-			tx = tx.Commit()
-			affected = tx.RowsAffected
-			err = tx.Error
+			err = tx.Commit().Error
 		}
 	}()
 
-	tx = where(ctx, tx, model)
-	field := getField(ctx, -1)
+	field := GetField(ctx, -1)
+	tx = Where(ctx, tx, model)
 
-	for _, value := range values {
-		v := value[field]
-		delete(value, field)
-		if err = tx.Where(field+" = ?", v).Updates(value).Error; err != nil {
+	for i := 0; i < values.Len(); i++ {
+		value := values.Index(i)
+		var v interface{}
+		if f, exists := db.NewScope(value.Interface()).FieldByName(field); exists {
+			v = f.Field.Interface()
+		}
+		if m, ok := value.Interface().(map[string]interface{}); ok {
+			v = m[field]
+			delete(m, field)
+		}
+		tx := tx.Where(field+" = ?", v).Updates(value.Interface())
+		if err = tx.Error; err != nil {
 			return
 		}
+		affected += tx.RowsAffected
 	}
 
 	return
 }
 
-// [DELETE] /:field/:value
+// Delete delete a model by field and params.
+// @Method: DELETE
+// @Params: model element
+// @URI: /$model/$field/:value
+// @Return: affected number
 func Delete(ctx *gin.Context, db *gorm.DB, model interface{}) (affected int64, err error) {
-	db = where(ctx, db, model)
-	field := getField(ctx, -2)
-	value := ctx.Param("value")
-
-	db = db.Where(field+" = ?", value).Delete(model)
+	db = Where(ctx, db, model, -2).Delete(model)
 
 	return db.RowsAffected, db.Error
 }
 
-// [DELETE] /:field []
+// Deletes delete multi model by field and params.
+// @Method: DELETE
+// @Params: model element
+// @URI: /$model/$field
+// @Return: affected number
 func Deletes(ctx *gin.Context, db *gorm.DB, model interface{}) (affected int64, err error) {
 	var values []interface{}
 	if err = ctx.Bind(&values); err != nil {
@@ -322,10 +518,9 @@ func Deletes(ctx *gin.Context, db *gorm.DB, model interface{}) (affected int64, 
 		return
 	}
 
-	db = where(ctx, db, model)
-	field := getField(ctx, -1)
+	field := GetField(ctx, -1)
 
-	db = db.Where(field+" IN (?)", values).Delete(model)
+	db = Where(ctx, db, model).Where(field+" IN (?)", values).Delete(model)
 
 	return db.RowsAffected, db.Error
 }
@@ -338,42 +533,42 @@ func Mount(mux gin.IRouter, db *gorm.DB, model interface{}, handler ...Handler) 
 	}
 
 	get := func(ctx *gin.Context) {
-		record, err := Get(ctx, db, model)
+		record, err := Get(ctx, useDB(ctx, db), model)
 		h.Return(ctx, record, err)
 	}
 
-	gets := func(ctx *gin.Context) {
-		result, err := Gets(ctx, db, model)
+	list := func(ctx *gin.Context) {
+		result, err := List(ctx, useDB(ctx, db), model)
 		h.Return(ctx, result, err)
 	}
 
-	post := func(ctx *gin.Context) {
-		record, err := Post(ctx, db, model)
+	create := func(ctx *gin.Context) {
+		record, err := Create(ctx, useDB(ctx, db), model)
 		h.Return(ctx, record, err)
 	}
 
-	posts := func(ctx *gin.Context) {
-		records, err := Posts(ctx, db, model)
+	creates := func(ctx *gin.Context) {
+		records, err := Creates(ctx, useDB(ctx, db), model)
 		h.Return(ctx, records, err)
 	}
 
-	put := func(ctx *gin.Context) {
-		affected, err := Put(ctx, db, model)
+	update := func(ctx *gin.Context) {
+		affected, err := Update(ctx, useDB(ctx, db), model)
 		h.Return(ctx, affected, err)
 	}
 
-	puts := func(ctx *gin.Context) {
-		affected, err := Puts(ctx, db, model)
+	updates := func(ctx *gin.Context) {
+		affected, err := Updates(ctx, useDB(ctx, db), model)
 		h.Return(ctx, affected, err)
 	}
 
 	del := func(ctx *gin.Context) {
-		affected, err := Delete(ctx, db, model)
+		affected, err := Delete(ctx, useDB(ctx, db), model)
 		h.Return(ctx, affected, err)
 	}
 
 	deletes := func(ctx *gin.Context) {
-		affected, err := Deletes(ctx, db, model)
+		affected, err := Deletes(ctx, useDB(ctx, db), model)
 		h.Return(ctx, affected, err)
 	}
 
@@ -383,14 +578,14 @@ func Mount(mux gin.IRouter, db *gorm.DB, model interface{}, handler ...Handler) 
 		for _, name := range []string{f.Name, f.DBName} {
 			field := mux.Group(name)
 			{
-				field.PUT("", puts)
+				field.PUT("", updates)
 				field.DELETE("", deletes)
 			}
 
 			value := field.Group("/:value")
 			{
 				value.GET("", get)
-				value.PUT("", put)
+				value.PUT("", update)
 				value.DELETE("", del)
 			}
 
@@ -401,7 +596,7 @@ func Mount(mux gin.IRouter, db *gorm.DB, model interface{}, handler ...Handler) 
 	}
 
 	// generate batch restful api
-	mux.GET("", gets)
+	mux.GET("", list)
 	mux.POST("", func(ctx *gin.Context) {
 		data, err := ioutil.ReadAll(ctx.Request.Body)
 		if err != nil {
@@ -423,11 +618,11 @@ func Mount(mux gin.IRouter, db *gorm.DB, model interface{}, handler ...Handler) 
 		}
 
 		if _, ok := v.([]interface{}); ok {
-			posts(ctx)
+			creates(ctx)
 			return
 		}
 
-		post(ctx)
+		create(ctx)
 	})
 
 	return mux
